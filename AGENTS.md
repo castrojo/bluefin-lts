@@ -4,6 +4,12 @@ Bluefin LTS is a container-based operating system image built on CentOS Stream 1
 
 Always reference these instructions first and fallback to search or bash commands only when you encounter unexpected information that does not match the info here.
 
+## Skills
+
+cat ~/src/skills/workflow/SKILL.md         # git push confirmation, CI watch, upstream PR rules
+cat ~/src/skills/bluefin-lts/SKILL.md      # LTS variant, critical production warnings
+cat ~/src/skills/bluefin-build/SKILL.md    # build, validation, PR workflow
+
 ## Working Effectively
 
 ### Prerequisites and Setup
