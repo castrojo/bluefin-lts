@@ -58,6 +58,16 @@ on:
         required: false
         type: string
         default: ""
+      gnome-version:
+        description: "GNOME major version to build (49 or 50)"
+        required: false
+        type: string
+        default: "49"
+      sign:
+        description: "Sign images and SBOM artifacts with cosign"
+        required: false
+        type: boolean
+        default: true
     secrets:
       SIGNING_SECRET:
         description: "The private key used to sign the image"
@@ -107,6 +117,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       image_tag: ${{ steps.build-image.outputs.image_tag }}
 
@@ -141,6 +153,7 @@ jobs:
           HWE: ${{ inputs.hwe }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag-suffix }}
         run: |
           set -x
           just=$(which just)
@@ -158,6 +171,10 @@ jobs:
             export DEFAULT_TAG="${DEFAULT_TAG}-${TAG_SUFFIX}"
           fi
 
+          if [ -n "${INPUT_TAG_SUFFIX}" ]; then
+            export DEFAULT_TAG="${DEFAULT_TAG}-${INPUT_TAG_SUFFIX}"
+          fi
+
           echo "DEFAULT_TAG=${DEFAULT_TAG}" >> "${GITHUB_ENV}"
           if [[ "${FLAVOR}" =~ "gdx" ]] ; then
             ENABLE_GDX=1
@@ -166,18 +183,20 @@ jobs:
             ENABLE_DX=1
           fi
 
-          sudo $just build "${IMAGE_NAME}" "${DEFAULT_TAG}" "${ENABLE_DX}" "${ENABLE_GDX}" "${ENABLE_HWE}" "${{ inputs.kernel-pin }}"
+          sudo $just build "${IMAGE_NAME}" "${DEFAULT_TAG}" "${ENABLE_DX}" "${ENABLE_GDX}" "${ENABLE_HWE}" "${{ inputs.kernel-pin }}" "${{ inputs.gnome-version }}"
           echo "image_tag=${DEFAULT_TAG}" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Syft
         id: setup-syft
-        if: ${{ github.ref == 'refs/heads/lts' && inputs.publish }}
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: v1.39.0
 
       - name: Generate SBOM
         id: generate-sbom
-        if: ${{ github.ref == 'refs/heads/lts' && inputs.publish }}
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
         continue-on-error: true
         env:
           IMAGE: ${{ env.IMAGE_NAME }}
@@ -185,10 +204,10 @@ jobs:
           SYFT_CMD: ${{ steps.setup-syft.outputs.cmd }}
         run: |
           sudo systemctl start podman.socket
-          OUTPUT_PATH="$(mktemp -d)/sbom.json"
+          SBOM="$(mktemp -d)/sbom.json"
           export SYFT_PARALLELISM=$(($(nproc)*2))
-          sudo "$SYFT_CMD" "${IMAGE}:${DEFAULT_TAG}" -o "spdx-json=${OUTPUT_PATH}"
-          echo "OUTPUT_PATH=${OUTPUT_PATH}" >> "${GITHUB_OUTPUT}"
+          sudo "$SYFT_CMD" "${IMAGE}:${DEFAULT_TAG}" -o "spdx-json=${SBOM}"
+          echo "SBOM=${SBOM}" >> "${GITHUB_OUTPUT}"
 
       - name: Run Rechunker
         if: ${{ inputs.rechunk && inputs.publish }}
@@ -254,7 +273,7 @@ jobs:
         if: ${{ inputs.publish }}
 
       - name: Sign Image
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.publish && inputs.sign }}
         run: |
           IMAGE_FULL="${IMAGE_REGISTRY}/${IMAGE_NAME}"
           cosign sign -y --key env://COSIGN_PRIVATE_KEY ${IMAGE_FULL}@${{ steps.push.outputs.remote_image_digest }}
@@ -263,37 +282,58 @@ jobs:
           COSIGN_EXPERIMENTAL: false
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
 
-      - name: Add SBOM Attestation
-        if: ${{ github.ref == 'refs/heads/lts' && inputs.publish }}
+      - name: Install ORAS
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
         continue-on-error: true
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+
+      - name: Login to GitHub Container Registry with ORAS
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
+        continue-on-error: true
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Upload SBOM
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
+        id: upload-sbom
         env:
           IMAGE: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
           DIGEST: ${{ steps.push.outputs.remote_image_digest }}
-          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
-          SBOM_OUTPUT: ${{ steps.generate-sbom.outputs.OUTPUT_PATH }}
+          SBOM: ${{ steps.generate-sbom.outputs.SBOM }}
         run: |
-          cd "$(dirname "$SBOM_OUTPUT")"
+          cd "$(dirname "${SBOM}")"
+          oras attach \
+            --artifact-type application/vnd.spdx+json \
+            --annotation "filename=$(basename "${SBOM}")" \
+            "${IMAGE}@${DIGEST}" \
+            "$(basename "${SBOM}")"
+          sbom_digest=$(oras discover --format json "${IMAGE}@${DIGEST}" \
+            | jq -r '[.referrers[] | select(.artifactType == "application/vnd.spdx+json") | .digest] | first')
+          if [[ -z "${sbom_digest}" || "${sbom_digest}" == "null" ]]; then
+            echo "ERROR: SBOM referrer not found after upload" >&2
+            exit 1
+          fi
+          echo "sbom_digest=${sbom_digest}" >> "${GITHUB_OUTPUT}"
 
-          # Compress the SBOM and create the predicate
-          TYPE="urn:ublue-os:attestation:spdx+json+zstd:v1"
-          zstd -19 "./sbom.json" -o "./sbom.json.zst"
-          BASE64_SBOM_FILE="payload.b64"
-          base64 "./sbom.json.zst" | tr -d '\n' > "${BASE64_SBOM_FILE}"
-          PREDICATE_FILE="payload.json"
-          jq -n \
-            --arg compression "zstd" \
-            --arg mediaType "application/spdx+json" \
-            --rawfile payload "${BASE64_SBOM_FILE}" \
-            '{compression: $compression, mediaType: $mediaType, payload: $payload}' \
-            > "$PREDICATE_FILE"
-          rm -f "${BASE64_SBOM_FILE}"
+      - name: Sign SBOM OCI Artifact
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish && inputs.sign }}
+        continue-on-error: true
+        env:
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          SBOM_DIGEST: ${{ steps.upload-sbom.outputs.sbom_digest }}
+        run: |
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE_REGISTRY}/${IMAGE_NAME}@${SBOM_DIGEST}"
 
-          # Create the attestation
-          cosign attest -y \
-            --predicate "${PREDICATE_FILE}" \
-            --type $TYPE \
-            --key env://COSIGN_PRIVATE_KEY \
-            "${IMAGE}@${DIGEST}"
+      - name: Attestation
+        if: ${{ (github.ref == 'refs/heads/lts' || github.ref == 'refs/heads/main') && inputs.publish }}
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 #v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.remote_image_digest }}
+          push-to-registry: true
 
       - name: Create Job Outputs
         if: ${{ inputs.publish }}
@@ -310,7 +350,7 @@ jobs:
         if: ${{ inputs.publish }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ matrix.platform }}
+          name: ${{ env.IMAGE_NAME }}-${{ matrix.platform }}${{ inputs.hwe && '-hwe' || '' }}${{ inputs.tag-suffix != '' && format('-{0}', inputs.tag-suffix) || '' }}
           retention-days: 1
           if-no-files-found: error
           path: |
@@ -324,7 +364,7 @@ jobs:
       - generate_matrix
       - build_push
     container:
-      image:  cgr.dev/chainguard/wolfi-base:latest@sha256:00f9662b838432de5f24eabe5dc86f20d1510d158eda1bcaf68bbba8412544cc
+      image:  cgr.dev/chainguard/wolfi-base:latest@sha256:a5a619c1793039dcf92f02178f37c94bb3d6001403716da59d6092dfe8d9b502
       options: --privileged --security-opt seccomp=unconfined
     permissions:
       contents: read
@@ -361,6 +401,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           HWE: ${{ inputs.hwe }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag-suffix }}
         run: |
           export CENTOS_VERSION_SUFFIX=""
           if [[ "${HWE}" == "true" ]] ; then
@@ -371,6 +412,10 @@ jobs:
             export TAG_SUFFIX="testing"
             export DEFAULT_TAG="${DEFAULT_TAG}-${TAG_SUFFIX}"
             export CENTOS_VERSION_SUFFIX="${CENTOS_VERSION_SUFFIX}-${TAG_SUFFIX}"
+          fi
+          if [ -n "${INPUT_TAG_SUFFIX}" ]; then
+            export DEFAULT_TAG="${DEFAULT_TAG}-${INPUT_TAG_SUFFIX}"
+            export CENTOS_VERSION_SUFFIX="${CENTOS_VERSION_SUFFIX}-${INPUT_TAG_SUFFIX}"
           fi
           echo "DEFAULT_TAG=${DEFAULT_TAG}" >> "${GITHUB_ENV}"
           echo "CENTOS_VERSION_SUFFIX=${CENTOS_VERSION_SUFFIX}" >> "${GITHUB_ENV}"
@@ -428,7 +473,7 @@ jobs:
 
       - name: Fetch Build Outputs
         if: ${{ inputs.publish }}
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: ${{ env.IMAGE_NAME }}-*
           merge-multiple: true
@@ -510,7 +555,7 @@ jobs:
   # so we move this to another step in order to run on Ubuntu
   sign:
     needs: manifest
-    if: ${{ inputs.publish }}
+    if: ${{ inputs.publish && inputs.sign }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
